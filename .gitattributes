@@ -1,2 +1,408 @@
-# Auto detect text files and perform LF normalization
-* text=auto
+/*
+     CÓDIGO:      Q0962-WebApp
+     SKETCH:      Controle IR com Web App
+*/
+
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <IRremote.hpp> // Biblioteca IRremote moderna
+
+// =======================================================
+// --- COLOQUE SEU WIFI AQUI ---
+const char* ssid = "Automate AC";
+const char* password = "caps+1234";
+// =======================================================
+
+WebServer server(80); // Servidor na porta 80
+
+// --- Definições do Sketch Original ---
+#ifndef LED_BUILTIN
+#define LED_BUILTIN 2
+#endif
+#define RAW_BUFFER_LENGTH  750
+#define MARK_EXCESS_MICROS  20
+#define pinLED 27 // Usado para indicar "Modo Gravação"
+#define IR_RECEIVE_PIN 15
+#define IR_SEND_PIN 4           
+#define STATUS_PIN LED_BUILTIN // Usado para indicar "Enviando"
+
+// Storage for the recorded code
+struct storedIRDataStruct {
+    IRData receivedIRData;
+    uint8_t rawCode[RAW_BUFFER_LENGTH];
+    uint16_t rawCodeLength;
+} sStoredIRData[10]; // Ainda temos 10 posições, mas a web usa 0, 1, 2
+
+int DELAY_BETWEEN_REPEAT = 50;
+int DEFAULT_NUMBER_OF_REPEATS_TO_SEND = 1;
+
+// --- Variáveis Globais para o Web App ---
+bool g_isRecording = false;         // Flag: estamos em modo de gravação?
+int g_recordingIndex = -1;          // Qual slot (0, 1 ou 2) estamos gravando?
+String g_lastStatusMessage = "Pronto."; // Última mensagem para o usuário
+
+// --- Protótipos das funções originais ---
+void storeCode(IRData *aIRReceivedData, int index);
+void sendCode(storedIRDataStruct *aIRDataToSend);
+
+// ====================================================================
+// --- PÁGINA WEB (HTML, CSS, JavaScript) ---
+// ====================================================================
+void handleRoot() {
+  String page = R"rawliteral(
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>Controle IR ESP32</title>
+    <style>
+        :root {
+            --bg-color: #f0f2f5;
+            --card-color: #ffffff;
+            --btn-color: #007bff;
+            --btn-hover: #0056b3;
+            --btn-record-color: #dc3545;
+            --btn-record-hover: #a71d2a;
+            --text-color: #333;
+            --shadow: 0 4px 8px rgba(0,0,0,0.1);
+        }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            background-color: var(--bg-color);
+            color: var(--text-color);
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            margin: 0;
+            padding: 10px;
+            box-sizing: border-box;
+        }
+        .container {
+            width: 100%;
+            max-width: 400px;
+            background-color: var(--card-color);
+            border-radius: 12px;
+            box-shadow: var(--shadow);
+            padding: 20px;
+            box-sizing: border-box;
+        }
+        h1 {
+            text-align: center;
+            color: var(--btn-color);
+            margin-top: 0;
+            margin-bottom: 20px;
+        }
+        #status {
+            text-align: center;
+            font-size: 1.1em;
+            font-weight: 500;
+            padding: 12px;
+            background-color: var(--bg-color);
+            border-radius: 8px;
+            margin-bottom: 20px;
+            min-height: 1.5em;
+            line-height: 1.5em;
+        }
+        .section {
+            margin-bottom: 20px;
+        }
+        h2 {
+            font-size: 1.2em;
+            margin-bottom: 10px;
+            border-bottom: 2px solid var(--bg-color);
+            padding-bottom: 5px;
+        }
+        .btn-grid {
+            display: grid;
+            grid-template-columns: 1fr;
+            gap: 12px;
+        }
+        .btn {
+            display: block;
+            width: 100%;
+            padding: 15px;
+            font-size: 1.1em;
+            font-weight: 600;
+            color: white;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: background-color 0.2s ease, transform 0.1s ease;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            -webkit-tap-highlight-color: transparent; /* Remove flash no mobile */
+        }
+        .btn:active {
+            transform: scale(0.98);
+        }
+        .btn-send {
+            background-color: var(--btn-color);
+        }
+        .btn-send:hover {
+            background-color: var(--btn-hover);
+        }
+        .btn-record {
+            background-color: var(--btn-record-color);
+        }
+        .btn-record:hover {
+            background-color: var(--btn-record-hover);
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Controle IR</h1>
+        
+        <div id="status">Pronto.</div>
+
+        <div class="section">
+            <h2>Controle</h2>
+            <div class="btn-grid">
+                <button class="btn btn-send" onclick="sendCommand(0)">Liga/Desliga</button>
+                <button class="btn btn-send" onclick="sendCommand(1)">Aumentar Temperatura</button>
+                <button class="btn btn-send" onclick="sendCommand(2)">Diminuir Temperatura</button>
+            </div>
+        </div>
+
+        <div class="section">
+            <h2>Gravação (Admin)</h2>
+            <div class="btn-grid">
+                <button class="btn btn-record" onclick="recordCommand(0)">Gravar Liga/Desliga (#0)</button>
+                <button class="btn btn-record" onclick="recordCommand(1)">Gravar Aumentar Temp (#1)</button>
+                <button class="btn btn-record" onclick="recordCommand(2)">Gravar Diminuir Temp (#2)</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const statusEl = document.getElementById('status');
+        let pollInterval;
+
+        function showStatus(message) {
+            statusEl.innerText = message;
+        }
+
+        // Função para enviar um comando
+        async function sendCommand(cmd) {
+            showStatus("Enviando comando...");
+            try {
+                const response = await fetch(`/send?cmd=${cmd}`);
+                const statusText = await response.text();
+                showStatus(statusText);
+            } catch (error) {
+                showStatus("Erro ao enviar comando.");
+            }
+        }
+
+        // Função para iniciar a gravação de um comando
+        async function recordCommand(cmd) {
+            showStatus("Ativando modo gravação...");
+            try {
+                const response = await fetch(`/record?cmd=${cmd}`);
+                const statusText = await response.text();
+                showStatus(statusText);
+                // Começa a verificar o status
+                if (!pollInterval) {
+                    pollInterval = setInterval(updateStatus, 1000);
+                }
+            } catch (error) {
+                showStatus("Erro ao ativar gravação.");
+            }
+        }
+
+        // Função para verificar o status da gravação
+        async function updateStatus() {
+            try {
+                const response = await fetch('/status');
+                const statusText = await response.text();
+                if (statusText) {
+                    showStatus(statusText);
+                    if (!statusText.startsWith("Gravando")) {
+                        // Gravação terminou ou falhou
+                        clearInterval(pollInterval);
+                        pollInterval = null;
+                    }
+                }
+            } catch (error) {
+                // Para de verificar se houver erro
+                clearInterval(pollInterval);
+                pollInterval = null;
+            }
+        }
+
+        // Inicia verificação caso a página seja recarregada durante uma gravação
+        pollInterval = setInterval(updateStatus, 1000);
+    </script>
+</body>
+</html>
+)rawliteral";
+  
+  server.send(200, "text/html", page);
+}
+
+// ====================================================================
+// --- LÓGICA DO SERVIDOR WEB ---
+// ====================================================================
+
+// Rota: /send?cmd=X
+// Envia um comando IR previamente gravado
+void handleSend() {
+    if (!server.hasArg("cmd")) {
+        server.send(400, "text/plain", "Erro: Comando invalido.");
+        return;
+    }
+    int index = server.arg("cmd").toInt();
+    
+    Serial.println("Enviando comando: " + String(index));
+    
+    digitalWrite(STATUS_PIN, HIGH);
+    sendCode(&sStoredIRData[index]); // Chama a função original
+    digitalWrite(STATUS_PIN, LOW);
+    
+    String msg = "Comando #" + String(index) + " enviado!";
+    server.send(200, "text/plain", msg);
+}
+
+// Rota: /record?cmd=X
+// Ativa o modo de gravação para um slot
+void handleRecord() {
+    if (!server.hasArg("cmd")) {
+        server.send(400, "text/plain", "Erro: Comando invalido.");
+        return;
+    }
+    
+    g_recordingIndex = server.arg("cmd").toInt();
+    g_isRecording = true;
+    IrReceiver.start(); // Inicia o receptor IR
+    
+    digitalWrite(pinLED, HIGH); // Liga o LED do pino 27 para indicar "gravando"
+    
+    String msg = "Gravando #" + String(g_recordingIndex) + "... Aponte o controle e aperte o botao.";
+    Serial.println(msg);
+    server.send(200, "text/plain", msg);
+}
+
+// Rota: /status
+// Usado pelo JavaScript para saber se a gravação terminou
+void handleStatus() {
+    String msg = "";
+    if (g_lastStatusMessage != "") {
+        msg = g_lastStatusMessage;
+        g_lastStatusMessage = ""; // Limpa a mensagem após enviar
+    } else if (g_isRecording) {
+        msg = "Gravando #" + String(g_recordingIndex) + "...";
+    }
+    server.send(200, "text/plain", msg);
+}
+
+// ====================================================================
+// --- FUNÇÕES DE SETUP E LOOP ---
+// ====================================================================
+
+void setupWiFi() {
+    Serial.print(F("Conectando a "));
+    Serial.println(ssid);
+    WiFi.begin(ssid, password);
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(500);
+        Serial.print(F("."));
+    }
+    Serial.println(F("\nWiFi conectado!"));
+    Serial.print(F("IP do ESP32: "));
+    Serial.println(WiFi.localIP());
+}
+
+void setupWebServer() {
+    server.on("/", HTTP_GET, handleRoot);
+    server.on("/send", HTTP_GET, handleSend);
+    server.on("/record", HTTP_GET, handleRecord);
+    server.on("/status", HTTP_GET, handleStatus);
+    server.begin();
+    Serial.println(F("Servidor web iniciado!"));
+}
+
+void setup() {
+    pinMode(pinLED, OUTPUT);
+    digitalWrite(pinLED, LOW);
+    pinMode(STATUS_PIN, OUTPUT);
+    digitalWrite(STATUS_PIN, LOW);
+    
+    Serial.begin(115200);
+    
+    IrReceiver.begin(IR_RECEIVE_PIN, ENABLE_LED_FEEDBACK);
+    IrSender.begin(IR_SEND_PIN, ENABLE_LED_FEEDBACK);
+    
+    setupWiFi();
+    setupWebServer();
+    
+    Serial.println(F("Sistema pronto. Acesse o IP no navegador."));
+}
+
+void loop() {
+    server.handleClient(); // Essencial para o servidor web funcionar
+
+    // Verifica se estamos no modo de gravação e se um código foi recebido
+    if (g_isRecording && IrReceiver.available()) {
+        digitalWrite(pinLED, LOW); // Apaga o LED de gravação
+        
+        storeCode(IrReceiver.read(), g_recordingIndex); // Chama a função original
+        
+        IrReceiver.resume();
+        g_isRecording = false;
+        
+        g_lastStatusMessage = "Comando #" + String(g_recordingIndex) + " gravado com sucesso!";
+        Serial.println(g_lastStatusMessage);
+        
+        g_recordingIndex = -1;
+    }
+}
+
+// ====================================================================
+// --- FUNÇÕES ORIGINAIS DO SKETCH (Sem modificações) ---
+// ====================================================================
+void storeCode(IRData *aIRReceivedData, int index) {
+    if (aIRReceivedData->flags & IRDATA_FLAGS_IS_REPEAT) {
+        Serial.println(F("Ignore repeat"));
+        return;
+    }
+    if (aIRReceivedData->flags & IRDATA_FLAGS_IS_AUTO_REPEAT) {
+        Serial.println(F("Ignore autorepeat"));
+        return;
+    }
+    if (aIRReceivedData->flags & IRDATA_FLAGS_PARITY_FAILED) {
+        Serial.println(F("Ignore parity error"));
+        return;
+    }
+
+    sStoredIRData[index].receivedIRData = *aIRReceivedData;
+
+    if (sStoredIRData[index].receivedIRData.protocol == UNKNOWN) {
+        Serial.print(F("Received unknown code and store "));
+        Serial.print(IrReceiver.decodedIRData.rawlen - 1);
+        Serial.println(F(" timing entries as raw "));
+        IrReceiver.printIRResultRawFormatted(&Serial, true);
+        sStoredIRData[index].rawCodeLength = IrReceiver.decodedIRData.rawlen - 1;
+        IrReceiver.compensateAndStoreIRResultInArray(sStoredIRData[index].rawCode);
+
+    } else {
+        IrReceiver.printIRResultShort(&Serial);
+        IrReceiver.printIRSendUsage(&Serial);
+        sStoredIRData[index].receivedIRData.flags = 0;
+        Serial.println();
+    }
+}
+
+void sendCode(storedIRDataStruct *aIRDataToSend) {
+    if (aIRDataToSend->receivedIRData.protocol == UNKNOWN /* i.e. raw */) {
+        IrSender.sendRaw(aIRDataToSend->rawCode, aIRDataToSend->rawCodeLength, 38);
+        Serial.print(F("Sent raw "));
+        Serial.print(aIRDataToSend->rawCodeLength);
+        Serial.println(F(" marks or spaces"));
+    } else {
+        IrSender.write(&aIRDataToSend->receivedIRData, DEFAULT_NUMBER_OF_REPEATS_TO_SEND);
+        Serial.print(F("Sent: "));
+        printIRResultShort(&Serial, &aIRDataToSend->receivedIRData, false);
+    }
+}
